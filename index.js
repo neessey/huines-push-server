@@ -1,110 +1,127 @@
-// index.js — petit serveur toujours actif (Railway) qui écoute Firestore et envoie
-// une vraie notification push (téléphone/navigateur fermé compris) à chaque nouvelle
-// commande, sans passer par Cloud Functions ni le plan Blaze.
+// Serveur Node/Express pour l'envoi de notifications FCM.
+// Même principe que le serveur Render déjà utilisé pour Huinest Food.
+// À déployer séparément (Render, Railway...) — les tokens FCM ne peuvent
+// PAS être envoyés depuis le navigateur, il faut une clé de compte de
+// service (service account) côté serveur.
 
 const express = require('express');
+const cors = require('cors');
 const admin = require('firebase-admin');
+const cron = require('node-cron');
+require('dotenv').config();
 
-// --- Init Firebase Admin ---------------------------------------------------
-// Colle le JSON de ta clé de service (Firebase Console → Paramètres du projet →
-// Comptes de service → Générer une nouvelle clé privée) en base64 dans la variable
-// d'environnement Railway FIREBASE_SERVICE_ACCOUNT_BASE64.
-const serviceAccountJson = Buffer.from(
-  process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 || '',
-  'base64'
-).toString('utf-8');
-
-if (!serviceAccountJson) {
-  console.error('❌ FIREBASE_SERVICE_ACCOUNT_BASE64 manquant. Le serveur ne peut pas démarrer.');
-  process.exit(1);
-}
-
-const serviceAccount = JSON.parse(serviceAccountJson);
+// --- Initialisation Firebase Admin ---
+// Récupérez le fichier JSON de clé de compte de service depuis :
+// Firebase Console > Paramètres du projet > Comptes de service > Générer une nouvelle clé privée
+// Collez son contenu (en une seule ligne) dans la variable d'env FIREBASE_SERVICE_ACCOUNT.
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-const db = admin.firestore();
-const messaging = admin.messaging();
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-// --- Suivi des commandes déjà notifiées (évite les doublons au redémarrage) -
-const startedAt = Date.now();
-const notifiedOrderIds = new Set();
+// --------------------------------------------------------------
+// POST /api/register-token
+// Abonne le jeton FCM d'un appareil à un ou plusieurs topics.
+// Appelé côté client juste après l'obtention du token (voir messaging.ts).
+// --------------------------------------------------------------
+app.post('/api/register-token', async (req, res) => {
+  const { uid, token, topics } = req.body;
 
-async function sendPushForOrder(orderId, order) {
-  const tokensSnap = await db.collection('staffDeviceTokens').get();
-  const tokens = tokensSnap.docs.map((d) => d.id);
-
-  if (tokens.length === 0) {
-    console.log(`Commande #${orderId} : aucun appareil staff enregistré, notification ignorée.`);
-    return;
+  if (!token || !Array.isArray(topics) || topics.length === 0) {
+    return res.status(400).json({ error: 'token et topics (tableau) sont requis.' });
   }
 
-  const message = {
-    notification: {
-      title: 'Nouvelle Commande ! 🍕',
-      body: `Commande #${orderId} de ${order.clientName} (${(order.total || 0).toLocaleString('fr-FR')} FCFA)`,
-    },
-    tokens,
-  };
-
-  const response = await messaging.sendEachForMulticast(message);
-  console.log(`Commande #${orderId} : ${response.successCount}/${tokens.length} notifications envoyées.`);
-
-  // Nettoyage des tokens invalides
-  const invalidTokens = [];
-  response.responses.forEach((res, idx) => {
-    if (!res.success) {
-      const code = res.error?.code;
-      if (
-        code === 'messaging/registration-token-not-registered' ||
-        code === 'messaging/invalid-registration-token'
-      ) {
-        invalidTokens.push(tokens[idx]);
-      }
+  try {
+    for (const topic of topics) {
+      await admin.messaging().subscribeToTopic(token, topic);
     }
-  });
+    console.log(`Token abonné (uid=${uid || 'inconnu'}) aux topics: ${topics.join(', ')}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Erreur abonnement topic:', err);
+    res.status(500).json({ error: 'Échec de l\'abonnement au topic.' });
+  }
+});
 
-  await Promise.all(
-    invalidTokens.map((t) => db.collection('staffDeviceTokens').doc(t).delete())
-  );
+// --------------------------------------------------------------
+// POST /api/send-notification
+// Envoie une notification à un topic (ex: "all-members").
+// Appelé depuis le Cockpit Admin (AdminDashboard.tsx).
+// --------------------------------------------------------------
+app.post('/api/send-notification', async (req, res) => {
+  const { title, body, topic } = req.body;
+
+  if (!title || !body || !topic) {
+    return res.status(400).json({ error: 'title, body et topic sont requis.' });
+  }
+
+  try {
+    const messageId = await admin.messaging().send({
+      topic,
+      notification: { title, body },
+      webpush: {
+        notification: {
+          icon: '/assets/logo.jpg',
+        },
+      },
+    });
+    console.log(`Notification envoyée (${messageId}) au topic "${topic}"`);
+    res.json({ success: true, messageId });
+  } catch (err) {
+    console.error('Erreur envoi notification:', err);
+    res.status(500).json({ error: 'Échec de l\'envoi de la notification.' });
+  }
+});
+
+// --------------------------------------------------------------
+// Rappels automatiques programmés (heure d'Abidjan = GMT, pas de décalage DST)
+// Adaptez les horaires/jours si votre programme change.
+// --------------------------------------------------------------
+function sendReminder(title, body, topic = 'all-members') {
+  admin.messaging()
+    .send({ topic, notification: { title, body } })
+    .then(id => console.log(`Rappel auto envoyé (${id}): ${title}`))
+    .catch(err => console.error('Erreur rappel auto:', err));
 }
 
-// --- Écoute Firestore en temps réel -----------------------------------------
-function watchOrders() {
-  db.collection('orders').onSnapshot(
-    (snapshot) => {
-      snapshot.docChanges().forEach((change) => {
-        if (change.type !== 'added') return;
-
-        const order = change.doc.data();
-        const orderId = change.doc.id;
-
-        const orderTime = order.timestamp ? new Date(order.timestamp).getTime() : 0;
-        const isNew = orderTime > startedAt && !notifiedOrderIds.has(orderId);
-        const shouldNotify = order.status === 'paid' || order.status === 'received';
-
-        if (isNew && shouldNotify) {
-          notifiedOrderIds.add(orderId);
-          sendPushForOrder(orderId, order).catch((err) =>
-            console.error(`Erreur en envoyant la notification pour #${orderId} :`, err)
-          );
-        }
-      });
-    },
-    (error) => {
-      console.error('Erreur Firestore onSnapshot :', error);
-    }
+// Mercredi 17h30 GMT — rappel culte d'enseignement (18h30)
+cron.schedule('30 17 * * 3', () => {
+  sendReminder(
+    'Culte d\'enseignement dans 1h',
+    'Rendez-vous à 18h30 à l\'Auditorium Central. Ne manquez pas ce temps de doctrine !'
   );
-}
+});
 
-watchOrders();
-console.log('✅ Serveur de notifications démarré, écoute Firestore (collection "orders")...');
+// Vendredi 21h00 GMT — rappel veillée de combat spirituel (22h00)
+cron.schedule('0 21 * * 5', () => {
+  sendReminder(
+    'Grande veillée ce soir dans 1h',
+    'La veillée de combat spirituel débute à 22h00 jusqu\'à 02h00. Préparez votre cœur !'
+  );
+});
 
-// --- Petit serveur HTTP pour que Railway garde le process actif -------------
-const app = express();
-app.get('/health', (_req, res) => res.json({ status: 'ok', listening: true }));
+// Dimanche 07h00 GMT — rappel culte d'impact (08h00)
+cron.schedule('0 7 * * 0', () => {
+  sendReminder(
+    'Culte du dimanche dans 1h',
+    'Le culte d\'impact et de miracles commence à 08h00. Venez nombreux !'
+  );
+});
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Health check dispo sur le port ${port}`));
+// Lundi 09h00 GMT — bilan hebdomadaire (exemple, à enrichir avec de vraies stats Firestore)
+cron.schedule('0 9 * * 1', () => {
+  sendReminder(
+    'Bilan de la semaine — Christ Army',
+    'Consultez le résumé des activités, enrôlements et enseignements publiés la semaine dernière.'
+  );
+});
+
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => {
+  console.log(`Serveur de notifications Christ Army démarré sur le port ${PORT}`);
+});
